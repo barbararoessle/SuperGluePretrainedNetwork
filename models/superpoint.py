@@ -84,7 +84,8 @@ def sample_descriptors(keypoints, descriptors, s: int = 8):
     keypoints /= torch.tensor([(w*s - s/2 - 0.5), (h*s - s/2 - 0.5)],
                               ).to(keypoints)[None]
     keypoints = keypoints*2 - 1  # normalize to (-1, 1)
-    args = {'align_corners': True} if torch.__version__ >= '1.3' else {}
+    major, minor = torch.__version__.split('.')[:2]
+    args = {'align_corners': True} if int(major) < 2 and int(minor) > 2 or int(major) >= 2 else {}
     descriptors = torch.nn.functional.grid_sample(
         descriptors, keypoints.view(b, 1, -1, 2), mode='bilinear', **args)
     descriptors = torch.nn.functional.normalize(
@@ -106,6 +107,7 @@ class SuperPoint(nn.Module):
         'keypoint_threshold': 0.005,
         'max_keypoints': -1,
         'remove_borders': 4,
+        'fill_with_random_keypoints' : False # data augmentation for training the matcher
     }
 
     def __init__(self, config):
@@ -144,59 +146,84 @@ class SuperPoint(nn.Module):
 
     def forward(self, data):
         """ Compute keypoints, scores, descriptors for image """
-        # Shared Encoder
-        x = self.relu(self.conv1a(data['image']))
-        x = self.relu(self.conv1b(x))
-        x = self.pool(x)
-        x = self.relu(self.conv2a(x))
-        x = self.relu(self.conv2b(x))
-        x = self.pool(x)
-        x = self.relu(self.conv3a(x))
-        x = self.relu(self.conv3b(x))
-        x = self.pool(x)
-        x = self.relu(self.conv4a(x))
-        x = self.relu(self.conv4b(x))
+        all_keypoints = []
+        all_scores = []
+        all_descriptors = []
+        for images in data['image']:
+            # Shared Encoder
+            x = self.relu(self.conv1a(images))
+            x = self.relu(self.conv1b(x))
+            x = self.pool(x)
+            x = self.relu(self.conv2a(x))
+            x = self.relu(self.conv2b(x))
+            x = self.pool(x)
+            x = self.relu(self.conv3a(x))
+            x = self.relu(self.conv3b(x))
+            x = self.pool(x)
+            x = self.relu(self.conv4a(x))
+            x = self.relu(self.conv4b(x))
+            # Compute the dense keypoint scores
+            cPa = self.relu(self.convPa(x))
+            scores = self.convPb(cPa)
+            scores = torch.nn.functional.softmax(scores, 1)[:, :-1]
+            b, _, h, w = scores.shape
+            scores = scores.permute(0, 2, 3, 1).reshape(b, h, w, 8, 8)
+            scores = scores.permute(0, 1, 3, 2, 4).reshape(b, h*8, w*8)
+            scores = simple_nms(scores, self.config['nms_radius'])
 
-        # Compute the dense keypoint scores
-        cPa = self.relu(self.convPa(x))
-        scores = self.convPb(cPa)
-        scores = torch.nn.functional.softmax(scores, 1)[:, :-1]
-        b, _, h, w = scores.shape
-        scores = scores.permute(0, 2, 3, 1).reshape(b, h, w, 8, 8)
-        scores = scores.permute(0, 1, 3, 2, 4).reshape(b, h*8, w*8)
-        scores = simple_nms(scores, self.config['nms_radius'])
+            # Extract keypoints
+            keypoints = [
+                torch.nonzero(s > self.config['keypoint_threshold'])
+                for s in scores]
+            scores = [s[tuple(k.t())] for s, k in zip(scores, keypoints)]
 
-        # Extract keypoints
-        keypoints = [
-            torch.nonzero(s > self.config['keypoint_threshold'])
-            for s in scores]
-        scores = [s[tuple(k.t())] for s, k in zip(scores, keypoints)]
+            # Discard keypoints near the image borders
+            if self.config['remove_borders'] > 0:
+                keypoints, scores = list(zip(*[
+                    remove_borders(k, s, self.config['remove_borders'], h*8, w*8)
+                    for k, s in zip(keypoints, scores)]))
 
-        # Discard keypoints near the image borders
-        keypoints, scores = list(zip(*[
-            remove_borders(k, s, self.config['remove_borders'], h*8, w*8)
-            for k, s in zip(keypoints, scores)]))
+            # Keep the k keypoints with highest score
+            if self.config['max_keypoints'] >= 0:
+                keypoints, scores = list(zip(*[
+                    top_k_keypoints(k, s, self.config['max_keypoints'])
+                    for k, s in zip(keypoints, scores)]))
+            
+                # Add random keypoints to fill up to max number of keypoints
+                if self.config['fill_with_random_keypoints']:
+                    keypoints_filled = []
+                    scores_filled = []
+                    border = self.config['remove_borders']
+                    for (k, s) in zip(keypoints, scores):
+                        if k.shape[0] < self.config['max_keypoints']:
+                            add_n = self.config['max_keypoints'] - k.shape[0]
+                            add_k = torch.cat((torch.randint(border, h * 8 - border, (add_n, 1), device=k.device), \
+                                torch.randint(border, w * 8 - border, (add_n, 1), device=k.device)), 1)
+                            k = torch.cat((k, add_k), 0)
+                            s = torch.cat((s, torch.zeros(add_n, device=s.device)), 0)
+                        keypoints_filled.append(k)
+                        scores_filled.append(s)
+                    keypoints = keypoints_filled
+                    scores = scores_filled
 
-        # Keep the k keypoints with highest score
-        if self.config['max_keypoints'] >= 0:
-            keypoints, scores = list(zip(*[
-                top_k_keypoints(k, s, self.config['max_keypoints'])
-                for k, s in zip(keypoints, scores)]))
+            # Convert (h, w) to (x, y)
+            keypoints = [torch.flip(k, [1]).float() for k in keypoints]
 
-        # Convert (h, w) to (x, y)
-        keypoints = [torch.flip(k, [1]).float() for k in keypoints]
+            # Compute the dense descriptors
+            cDa = self.relu(self.convDa(x))
+            descriptors = self.convDb(cDa)
+            descriptors = torch.nn.functional.normalize(descriptors, p=2, dim=1)
 
-        # Compute the dense descriptors
-        cDa = self.relu(self.convDa(x))
-        descriptors = self.convDb(cDa)
-        descriptors = torch.nn.functional.normalize(descriptors, p=2, dim=1)
-
-        # Extract descriptors
-        descriptors = [sample_descriptors(k[None], d[None], 8)[0]
-                       for k, d in zip(keypoints, descriptors)]
+            # Extract descriptors
+            descriptors = [sample_descriptors(k[None], d[None], 8)[0]
+                        for k, d in zip(keypoints, descriptors)]
+            
+            all_keypoints = all_keypoints + keypoints
+            all_scores = all_scores + list(scores)
+            all_descriptors = all_descriptors + descriptors
 
         return {
-            'keypoints': keypoints,
-            'scores': scores,
-            'descriptors': descriptors,
+            'keypoints': all_keypoints,
+            'scores': all_scores,
+            'descriptors': all_descriptors,
         }
